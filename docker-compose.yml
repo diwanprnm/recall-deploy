@@ -1,0 +1,54 @@
+version: '3.8'
+
+services:
+  frontend:
+    build:
+      context: ./recall-web
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=development
+      - NEXT_PUBLIC_SUPABASE_URL=${NEXT_PUBLIC_SUPABASE_URL:-}
+      - NEXT_PUBLIC_SUPABASE_ANON_KEY=${NEXT_PUBLIC_SUPABASE_ANON_KEY:-}
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    volumes:
+      - ./recall-web:/app
+      - ./recall-web/.next:/app/.next
+      - /var/www/my-app/node_modules:/app/node_modules
+
+  backend:
+    build:
+      context: ./recall-api
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=development
+      - HOST=0.0.0.0
+      - PORT=8000
+      - DEBUG=true
+      - SUPABASE_URL=${SUPABASE_URL:-}
+      - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY:-}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ALLOWED_ORIGINS=http://localhost:3000
+    volumes:
+      - ./recall-api:/app
+      - ./recall-api/.env:/app/.env
+      - /var/www/my-app/node_modules:/app/node_modules
+
+  nginx:
+    image: nginx:latest
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf
+      - ./nginx/ssl:/etc/nginx/ssl/:ro
+    depends_on:
+      - frontend
+      - backend
+
+volumes:
+  node_modules:
