@@ -1,0 +1,6 @@
+[submodule "recall-api"]
+	path = recall-api
+	url = https://github.com/diwanprnm/recall-api.git
+[submodule "recall-web"]
+	path = recall-web
+	url = https://github.com/diwanprnm/recall-web.git
