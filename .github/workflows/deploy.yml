@@ -1,0 +1,104 @@
+# GitHub Actions: Auto-deploy Recall on push to main
+#
+# Requirements (set as GitHub repository secrets):
+#   - VPS_HOST         : SSH host (e.g. your.vps.ip)
+#   - VPS_USER         : SSH username (e.g. root, or the deploy user)
+#   - VPS_SSH_KEY      : private SSH key (with passphrase-less access to VPS)
+#   - VPS_PORT         : optional SSH port (default 22)
+#
+# This workflow:
+#   1. Checks out the deploy repo with submodules (recall-api, recall-web)
+#   2. Connects to your VPS over SSH
+#   3. Runs the deploy.sh script which:
+#        - pulls latest submodule changes
+#        - runs docker compose pull + up -d --build
+
+name: Deploy Recall (main)
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: # allow manual trigger from GitHub UI
+
+jobs:
+  deploy:
+    name: Deploy to VPS
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Validate deploy script exists
+        run: |
+          if [ ! -f deploy.sh ]; then
+            echo "ERROR: deploy.sh not found in repo root."
+            exit 1
+          fi
+          echo "deploy.sh found ✓"
+
+      - name: Set up SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.VPS_SSH_KEY }}
+
+      - name: Add VPS to known hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H -p "${VPS_PORT:-22}" "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts
+          echo "VPS added to known_hosts ✓"
+
+      - name: Deploy to VPS
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
+        run: |
+          set -e
+          PORT="${VPS_PORT:-22}"
+          echo "Connecting to ${VPS_USER}@${VPS_HOST}:${PORT} ..."
+
+          # Push deploy script + helper env to the VPS, then run it.
+          # We pass GIT_TOKEN so submodule pulls work over HTTPS without auth prompts.
+          ssh -p "$PORT" "${VPS_USER}@${VPS_HOST}" bash -s << 'EOF'
+            set -e
+
+            cd /var/www/my-app
+
+            # Make sure we are on main and clean
+            git checkout main
+            git pull --ff-only origin main
+
+            # Update submodules to the latest commit registered in the parent repo
+            git submodule sync --recursive
+            git submodule update --init --recursive --force
+
+            # Re-exec the deploy script committed in the repo
+            chmod +x deploy.sh
+            ./deploy.sh main
+          EOF
+
+      - name: Verify deployment
+        if: success()
+        run: |
+          echo "Deployment finished. Smoke test:"
+          set +e
+          curl -fsS -o /dev/null -w "HTTP %{http_code} | %{url_effective}\n" \
+            "https://its.theonezone.my.id/" --connect-timeout 10 || true
+          echo "Note: substitute 'its.theonezone.my.id' with whichever domain you wire up."
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "❌ Deploy failed. Inspect the job log above."
+          echo "Common causes:"
+          echo "  - VPS_SSH_KEY invalid or does not match VPS authorized_keys"
+          echo "  - /var/www/my-app path missing on VPS"
+          echo "  - docker daemon not running"
+          echo "  - submodule auth failed (need GIT_TOKEN secret for https submodules)"
