@@ -90,8 +90,11 @@ jobs:
           echo "Deployment finished. Smoke test:"
           set +e
           curl -fsS -o /dev/null -w "HTTP %{http_code} | %{url_effective}\n" \
-            "https://its.theonezone.my.id/" --connect-timeout 10 || true
-          echo "Note: substitute 'its.theonezone.my.id' with whichever domain you wire up."
+            "https://recall.theonezone.my.id/" --connect-timeout 10 || true
+          curl -fsS -o /dev/null -w "HTTP %{http_code} | %{url_effective}\n" \
+            "https://apirecall.theonezone.my.id/health" --connect-timeout 10 || true
+          echo "✓ Frontend: https://recall.theonezone.my.id/"
+          echo "✓ Backend API: https://apirecall.theonezone.my.id/"
 
       - name: Notify on failure
         if: failure()
