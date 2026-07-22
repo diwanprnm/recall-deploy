@@ -1,144 +1,202 @@
-# GitHub Actions: Auto-deploy Recall on push to main
+# GitHub Actions: Build → Push to ghcr.io → Deploy to VPS
 #
 # Secrets required (Settings → Secrets and variables → Actions):
-#   VPS_HOST     : your server IP or domain (e.g. app.theonezone.my.id)
+#   VPS_HOST     : server IP or domain (e.g. app.theonezone.my.id)
 #   VPS_USER     : SSH username (e.g. root)
-#   VPS_SSH_KEY  : private SSH key content
+#   VPS_SSH_KEY  : private SSH key
 #   VPS_PORT     : SSH port (optional, default: 22)
-#   GIT_TOKEN    : GitHub PAT for submodule HTTPS pulls (optional if SSH works)
+#   GHCR_TOKEN   : Fine-grained PAT with read:packages scope
+#
+# Registry: ghcr.io (GitHub Container Registry)
+#   - Free for public repos
+#   - Auth: GHCR_TOKEN (fine-grained PAT)
+#
+# Image tags: sha-{short_sha} (e.g. sha-abc1234)
+#   ghcr.io/diwanprnm/recall-deploy/recall-web:sha-abc1234
+#   ghcr.io/diwanprnm/recall-deploy/recall-api:sha-abc1234
 
-name: Deploy Recall (main)
+name: CI/CD - Build, Push & Deploy
 
 on:
   push:
     branches:
       - main
   workflow_dispatch:
-    inputs:
-      branch:
-        description: 'Branch to deploy'
-        required: false
-        default: 'main'
+
+env:
+  REGISTRY: ghcr.io
+  REPO_OWNER: diwanprnm
+  FRONTEND_IMAGE: ghcr.io/diwanprnm/recall-deploy/recall-web
+  BACKEND_IMAGE: ghcr.io/diwanprnm/recall-deploy/recall-api
 
 jobs:
-  deploy:
-    name: Deploy to VPS
+  build-and-push:
+    name: Build & Push Images
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
+    outputs:
+      short_sha: ${{ steps.vars.outputs.SHORT_SHA }}
+      image_tag: ${{ steps.vars.outputs.IMAGE_TAG }}
+
     steps:
-      # ── 1. Checkout the deployment repo with submodules ──
+      # ── 1. Checkout with submodules ──
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 0
 
-      # ── 2. Debug show files available ──
-      - name: Debug List repo files
+      # ── 2. Get commit info ──
+      - name: Get commit info
+        id: vars
         run: |
-          echo "=== Repository root files ==="
-          ls -la
-          echo ""
-          echo "=== deploy.sh content check ==="
-          if [ -f deploy.sh ]; then
-            echo "deploy.sh FOUND ✓"
-            head -5 deploy.sh
-          else
-            echo "deploy.sh NOT FOUND ✗"
-            echo "Files in root:"
-            ls -la | grep -v "^total"
-          fi
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          IMAGE_TAG="sha-${SHORT_SHA}"
+          echo "SHORT_SHA=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "Commit: ${{ github.sha }} → Tag: $IMAGE_TAG"
 
-      # ── 3. Setup SSH agent ──
-      - name: Set up SSH
+      # ── 3. Login to ghcr.io ──
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      # ── 4. Build & Push Frontend (recall-web) ──
+      - name: Build and push recall-web
+        working-directory: ./recall-web
+        run: |
+          docker build \
+            --tag ${{ env.FRONTEND_IMAGE }}:${{ steps.vars.outputs.IMAGE_TAG }} \
+            --tag ${{ env.FRONTEND_IMAGE }}:latest \
+            --build-arg NEXT_PUBLIC_SUPABASE_URL=${{ secrets.NEXT_PUBLIC_SUPABASE_URL }} \
+            --build-arg NEXT_PUBLIC_SUPABASE_ANON_KEY=${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }} \
+            --build-arg NEXT_PUBLIC_API_URL=https://apirecall.theonezone.my.id \
+            --provenance false \
+            .
+
+          docker push -a ${{ env.FRONTEND_IMAGE }}
+          echo "✓ Frontend image pushed: ${{ env.FRONTEND_IMAGE }}:${{ steps.vars.outputs.IMAGE_TAG }}"
+          echo "✓ Frontend image pushed: ${{ env.FRONTEND_IMAGE }}:latest"
+
+      # ── 5. Build & Push Backend (recall-api) ──
+      - name: Build and push recall-api
+        working-directory: ./recall-api
+        run: |
+          docker build \
+            --tag ${{ env.BACKEND_IMAGE }}:${{ steps.vars.outputs.IMAGE_TAG }} \
+            --tag ${{ env.BACKEND_IMAGE }}:latest \
+            --build-arg SUPABASE_URL=${{ secrets.SUPABASE_URL }} \
+            --build-arg SUPABASE_SERVICE_ROLE_KEY=${{ secrets.SUPABASE_SERVICE_ROLE_KEY }} \
+            --build-arg OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }} \
+            --provenance false \
+            .
+
+          docker push -a ${{ env.BACKEND_IMAGE }}
+          echo "✓ Backend image pushed: ${{ env.BACKEND_IMAGE }}:${{ steps.vars.outputs.IMAGE_TAG }}"
+          echo "✓ Backend image pushed: ${{ env.BACKEND_IMAGE }}:latest"
+
+  deploy:
+    name: Deploy to VPS
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: build-and-push
+
+    steps:
+      # ── 6. Setup SSH ──
+      - name: Setup SSH
         uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.VPS_SSH_KEY }}
 
-      # ── 4. Add VPS to known_hosts ──
       - name: Add VPS to known hosts
         run: |
           mkdir -p "$HOME/.ssh"
           ssh-keyscan -H -p "${VPS_PORT:-22}" "${{ secrets.VPS_HOST }}" >> "$HOME/.ssh/known_hosts" 2>/dev/null
-          chmod 600 "$HOME/.ssh/known_hosts"
-          echo "VPS added to known_hosts ✓"
+          echo "✓ VPS added to known_hosts"
 
-      # ── 5. Deploy via SSH ──
+      # ── 7. Deploy via SSH ──
       - name: Deploy to VPS
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
           VPS_PORT: ${{ secrets.VPS_PORT }}
-          GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
-          DEPLOY_BRANCH: ${{ github.event.inputs.branch || 'main' }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          REGISTRY: ${{ env.REGISTRY }}
+          REPO_OWNER: ${{ env.REPO_OWNER }}
+          FRONTEND_IMAGE: ${{ env.FRONTEND_IMAGE }}
+          BACKEND_IMAGE: ${{ env.BACKEND_IMAGE }}
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+          SHORT_SHA: ${{ needs.build-and-push.outputs.short_sha }}
         run: |
           set -e
           PORT="${VPS_PORT:-22}"
           echo "=========================================="
           echo "Connecting to ${VPS_USER}@${VPS_HOST}:${PORT}"
-          echo "Branch: $DEPLOY_BRANCH"
+          echo "Image tag: $IMAGE_TAG"
           echo "=========================================="
 
           ssh -p "$PORT" \
-              -o StrictHostKeyChecking=no \
-              -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
-              "${VPS_USER}@${VPS_HOST}" bash -s << 'SSH_SCRIPT'
+             -o StrictHostKeyChecking=no \
+             -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+             "${VPS_USER}@${VPS_HOST}" bash -s << 'DEPLOY_SCRIPT'
           set -euo pipefail
 
-          APP_DIR="/var/www/my-app"
-          BRANCH="${DEPLOY_BRANCH:-main}"
+          REGISTRY="${REGISTRY}"
+          REPO_OWNER="${REPO_OWNER}"
+          FRONTEND_IMAGE="${FRONTEND_IMAGE}"
+          BACKEND_IMAGE="${BACKEND_IMAGE}"
+          IMAGE_TAG="${IMAGE_TAG}"
+          GHCR_TOKEN="${GHCR_TOKEN}"
 
           echo ""
           echo "=========================================="
-          echo "  DEPLOYMENT STARTED ON VPS"
+          echo "  DEPLOYMENT ON VPS"
           echo "=========================================="
+          echo "Tag: $IMAGE_TAG"
           echo "User: $(whoami)"
-          echo "Branch: $BRANCH"
 
-          # Change to app directory
-          cd "$APP_DIR" || { echo "ERROR: $APP_DIR does not exist"; exit 1; }
-
-          # Git: pull latest deployment repo
+          # ── Login to ghcr.io ──
           echo ""
-          echo "▶ Fetching latest code..."
-          git remote get-url origin >/dev/null 2>&1 || { echo "ERROR: git remote 'origin' not configured"; exit 1; }
-          git config --global --add safe.directory "$APP_DIR" || true
-          CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')"
-          if [ "$CURRENT_BRANCH" != "$BRANCH" ]; then
-            git fetch origin --prune
-            git checkout "$BRANCH"
-          fi
-          git pull --ff-only origin "$BRANCH"
-          echo "✓ Deployment repo updated"
+          echo "▶ Logging into $REGISTRY..."
+          echo "$GHCR_TOKEN" | docker login "$REGISTRY" -u "$REPO_OWNER" --password-stdin
+          echo "✓ Logged into $REGISTRY"
 
-          # Update submodules (recall-api + recall-web)
+          # ── Update docker-compose.yml with new image tags ──
           echo ""
-          echo "▶ Updating submodules..."
-          git submodule sync --recursive
-          # Try submodule update; if HTTPS fails, try with token
-          GIT_TOKEN="${GIT_TOKEN:-}" \
-            git submodule update --init --recursive --force \
-            || git -c submodule.recurse.url="https://x-access-token:${GIT_TOKEN}@github.com/diwanprnm/recall-api.git" \
-                 submodule update --init --recursive --force \
-            || echo "⚠ Submodule update had issues (may be OK)"
-          echo "✓ Submodules updated"
+          echo "▶ Updating docker-compose.yml with new image tags..."
+          cd /var/www/my-app
 
-          # Stop old containers (my-app-frontend-1, my-app-backend-1)
+          # Update frontend image tag
+          sed -i "s|image: my-app-frontend|image: ${FRONTEND_IMAGE}:${IMAGE_TAG}|" docker-compose.yml
+          # Update backend image tag
+          sed -i "s|image: my-app-backend|image: ${BACKEND_IMAGE}:${IMAGE_TAG}|" docker-compose.yml
+
+          echo "✓ docker-compose.yml updated"
+          cat docker-compose.yml | grep -E "image:|frontend:|backend:" | head -10
+
+          # ── Stop old containers ──
           echo ""
           echo "▶ Stopping old containers..."
-          docker stop my-app-frontend-1 my-app-backend-1 2>/dev/null || true
-          docker rm my-app-frontend-1 my-app-backend-1 2>/dev/null || true
+          docker compose -f docker-compose.yml down --remove-orphans 2>/dev/null || true
           echo "✓ Old containers stopped"
 
-          # Build and start services with docker-compose
+          # ── Pull new images ──
           echo ""
-          echo "▶ Building and starting containers..."
-          docker compose -f docker-compose.yml pull --ignore-pull-failures 2>/dev/null || true
-          docker compose -f docker-compose.yml up -d --build --remove-orphans
+          echo "▶ Pulling new images from $REGISTRY..."
+          docker compose -f docker-compose.yml pull
+          echo "✓ Images pulled"
+
+          # ── Start containers ──
+          echo ""
+          echo "▶ Starting containers..."
+          docker compose -f docker-compose.yml up -d --no-build
           echo "✓ Containers started"
 
-          # Show status
+          # ── Show status ──
           echo ""
           echo "▶ Container status:"
           docker compose -f docker-compose.yml ps
@@ -147,9 +205,9 @@ jobs:
           echo "=========================================="
           echo "  DEPLOYMENT COMPLETED ✓"
           echo "=========================================="
-          SSH_SCRIPT
+          DEPLOY_SCRIPT
 
-      # ── 6. Verify deployment ──
+      # ── 8. Verify ──
       - name: Verify deployment
         if: success()
         run: |
@@ -159,39 +217,23 @@ jobs:
           echo "=========================================="
           set +e
 
-          # Test frontend
-          FRONTEND_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://recall.theonezone.my.id/" --connect-timeout 15 --max-time 30)
-          if [ "$FRONTEND_STATUS" = "200" ]; then
-            echo "✓ Frontend: https://recall.theonezone.my.id/ → HTTP $FRONTEND_STATUS"
-          else
-            echo "⚠ Frontend: https://recall.theonezone.my.id/ → HTTP $FRONTEND_STATUS (may be warming up)"
-          fi
+          FRONTEND_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            "https://recall.theonezone.my.id/" --connect-timeout 15 --max-time 30)
+          echo "✓ Frontend: https://recall.theonezone.my.id/ → HTTP $FRONTEND_STATUS"
 
-          # Test API
-          API_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://apirecall.theonezone.my.id/health" --connect-timeout 15 --max-time 30 2>/dev/null || echo "000")
-          if [ "$API_STATUS" = "200" ] || [ "$API_STATUS" = "404" ]; then
-            echo "✓ Backend API: https://apirecall.theonezone.my.id/ → HTTP $API_STATUS"
-          else
-            echo "⚠ Backend API: https://apirecall.theonezone.my.id/ → HTTP $API_STATUS (may be warming up)"
-          fi
+          API_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            "https://apirecall.theonezone.my.id/health" --connect-timeout 15 --max-time 30 2>/dev/null || echo "000")
+          echo "✓ Backend API: https://apirecall.theonezone.my.id/ → HTTP $API_STATUS"
 
           echo ""
           echo "=========================================="
-          echo "  DEPLOYMENT FINISHED"
+          echo "  DONE"
           echo "=========================================="
 
       - name: Notify failure
         if: failure()
         run: |
-          echo ""
           echo "=========================================="
           echo "  ❌ DEPLOYMENT FAILED"
           echo "=========================================="
-          echo "Common causes:"
-          echo "  1. VPS_SSH_KEY secret is missing or wrong"
-          echo "  2. VPS_HOST / VPS_USER secrets are incorrect"
-          echo "  3. SSH connection refused (VPS down or port wrong)"
-          echo "  4. /var/www/my-app directory missing on VPS"
-          echo "  5. Docker not running on VPS"
-          echo ""
-          echo "Check the job log above for details."
+          echo "Check job log above for details."
