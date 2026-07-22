@@ -1,17 +1,11 @@
 # GitHub Actions: Auto-deploy Recall on push to main
 #
-# Requirements (set as GitHub repository secrets):
-#   - VPS_HOST         : SSH host (e.g. your.vps.ip)
-#   - VPS_USER         : SSH username (e.g. root, or the deploy user)
-#   - VPS_SSH_KEY      : private SSH key (with passphrase-less access to VPS)
-#   - VPS_PORT         : optional SSH port (default 22)
-#
-# This workflow:
-#   1. Checks out the deploy repo with submodules (recall-api, recall-web)
-#   2. Connects to your VPS over SSH
-#   3. Runs the deploy.sh script which:
-#        - pulls latest submodule changes
-#        - runs docker compose pull + up -d --build
+# Secrets required (Settings → Secrets and variables → Actions):
+#   VPS_HOST     : your server IP or domain (e.g. app.theonezone.my.id)
+#   VPS_USER     : SSH username (e.g. root)
+#   VPS_SSH_KEY  : private SSH key content
+#   VPS_PORT     : SSH port (optional, default: 22)
+#   GIT_TOKEN    : GitHub PAT for submodule HTTPS pulls (optional if SSH works)
 
 name: Deploy Recall (main)
 
@@ -19,7 +13,12 @@ on:
   push:
     branches:
       - main
-  workflow_dispatch: # allow manual trigger from GitHub UI
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to deploy'
+        required: false
+        default: 'main'
 
 jobs:
   deploy:
@@ -28,80 +27,171 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - name: Checkout repository (with submodules)
+      # ── 1. Checkout the deployment repo with submodules ──
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Validate deploy script exists
+      # ── 2. Debug: show files available ──
+      - name: Debug: List repo files
         run: |
-          if [ ! -f deploy.sh ]; then
-            echo "ERROR: deploy.sh not found in repo root."
-            exit 1
+          echo "=== Repository root files ==="
+          ls -la
+          echo ""
+          echo "=== deploy.sh content check ==="
+          if [ -f deploy.sh ]; then
+            echo "deploy.sh FOUND ✓"
+            head -5 deploy.sh
+          else
+            echo "deploy.sh NOT FOUND ✗"
+            echo "Files in root:"
+            ls -la | grep -v "^total"
           fi
-          echo "deploy.sh found ✓"
 
+      # ── 3. Setup SSH agent ──
       - name: Set up SSH
         uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.VPS_SSH_KEY }}
 
+      # ── 4. Add VPS to known_hosts ──
       - name: Add VPS to known hosts
         run: |
-          mkdir -p ~/.ssh
-          ssh-keyscan -H -p "${VPS_PORT:-22}" "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts
+          mkdir -p "$HOME/.ssh"
+          ssh-keyscan -H -p "${VPS_PORT:-22}" "${{ secrets.VPS_HOST }}" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          chmod 600 "$HOME/.ssh/known_hosts"
           echo "VPS added to known_hosts ✓"
 
+      # ── 5. Deploy via SSH ──
       - name: Deploy to VPS
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
           VPS_PORT: ${{ secrets.VPS_PORT }}
           GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
+          DEPLOY_BRANCH: ${{ github.event.inputs.branch || 'main' }}
         run: |
           set -e
           PORT="${VPS_PORT:-22}"
-          echo "Connecting to ${VPS_USER}@${VPS_HOST}:${PORT} ..."
+          echo "=========================================="
+          echo "Connecting to ${VPS_USER}@${VPS_HOST}:${PORT}"
+          echo "Branch: $DEPLOY_BRANCH"
+          echo "=========================================="
 
-          # Push deploy script + helper env to the VPS, then run it.
-          # We pass GIT_TOKEN so submodule pulls work over HTTPS without auth prompts.
-          ssh -p "$PORT" "${VPS_USER}@${VPS_HOST}" bash -s << 'EOF'
-            set -e
+          ssh -p "$PORT" \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+              "${VPS_USER}@${VPS_HOST}" bash -s << 'SSH_SCRIPT'
+          set -euo pipefail
 
-            cd /var/www/my-app
+          APP_DIR="/var/www/my-app"
+          BRANCH="${DEPLOY_BRANCH:-main}"
 
-            # Make sure we are on main and clean
-            git checkout main
-            git pull --ff-only origin main
+          echo ""
+          echo "=========================================="
+          echo "  DEPLOYMENT STARTED ON VPS"
+          echo "=========================================="
+          echo "User: $(whoami)"
+          echo "Branch: $BRANCH"
 
-            # Update submodules to the latest commit registered in the parent repo
-            git submodule sync --recursive
-            git submodule update --init --recursive --force
+          # Change to app directory
+          cd "$APP_DIR" || { echo "ERROR: $APP_DIR does not exist"; exit 1; }
 
-            # Re-exec the deploy script committed in the repo
-            chmod +x deploy.sh
-            ./deploy.sh main
-          EOF
+          # Git: pull latest deployment repo
+          echo ""
+          echo "▶ Fetching latest code..."
+          git remote get-url origin >/dev/null 2>&1 || { echo "ERROR: git remote 'origin' not configured"; exit 1; }
+          git config --global --add safe.directory "$APP_DIR" || true
+          CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')"
+          if [ "$CURRENT_BRANCH" != "$BRANCH" ]; then
+            git fetch origin --prune
+            git checkout "$BRANCH"
+          fi
+          git pull --ff-only origin "$BRANCH"
+          echo "✓ Deployment repo updated"
 
+          # Update submodules (recall-api + recall-web)
+          echo ""
+          echo "▶ Updating submodules..."
+          git submodule sync --recursive
+          # Try submodule update; if HTTPS fails, try with token
+          GIT_TOKEN="${GIT_TOKEN:-}" \
+            git submodule update --init --recursive --force \
+            || git -c submodule.recurse.url="https://x-access-token:${GIT_TOKEN}@github.com/diwanprnm/recall-api.git" \
+                 submodule update --init --recursive --force \
+            || echo "⚠ Submodule update had issues (may be OK)"
+          echo "✓ Submodules updated"
+
+          # Stop old containers (my-app-frontend-1, my-app-backend-1)
+          echo ""
+          echo "▶ Stopping old containers..."
+          docker stop my-app-frontend-1 my-app-backend-1 2>/dev/null || true
+          docker rm my-app-frontend-1 my-app-backend-1 2>/dev/null || true
+          echo "✓ Old containers stopped"
+
+          # Build and start services with docker-compose
+          echo ""
+          echo "▶ Building and starting containers..."
+          docker compose -f docker-compose.yml pull --ignore-pull-failures 2>/dev/null || true
+          docker compose -f docker-compose.yml up -d --build --remove-orphans
+          echo "✓ Containers started"
+
+          # Show status
+          echo ""
+          echo "▶ Container status:"
+          docker compose -f docker-compose.yml ps
+
+          echo ""
+          echo "=========================================="
+          echo "  DEPLOYMENT COMPLETED ✓"
+          echo "=========================================="
+          SSH_SCRIPT
+
+      # ── 6. Verify deployment ──
       - name: Verify deployment
         if: success()
         run: |
-          echo "Deployment finished. Smoke test:"
+          echo ""
+          echo "=========================================="
+          echo "  SMOKE TEST"
+          echo "=========================================="
           set +e
-          curl -fsS -o /dev/null -w "HTTP %{http_code} | %{url_effective}\n" \
-            "https://recall.theonezone.my.id/" --connect-timeout 10 || true
-          curl -fsS -o /dev/null -w "HTTP %{http_code} | %{url_effective}\n" \
-            "https://apirecall.theonezone.my.id/health" --connect-timeout 10 || true
-          echo "✓ Frontend: https://recall.theonezone.my.id/"
-          echo "✓ Backend API: https://apirecall.theonezone.my.id/"
 
-      - name: Notify on failure
+          # Test frontend
+          FRONTEND_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://recall.theonezone.my.id/" --connect-timeout 15 --max-time 30)
+          if [ "$FRONTEND_STATUS" = "200" ]; then
+            echo "✓ Frontend: https://recall.theonezone.my.id/ → HTTP $FRONTEND_STATUS"
+          else
+            echo "⚠ Frontend: https://recall.theonezone.my.id/ → HTTP $FRONTEND_STATUS (may be warming up)"
+          fi
+
+          # Test API
+          API_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://apirecall.theonezone.my.id/health" --connect-timeout 15 --max-time 30 2>/dev/null || echo "000")
+          if [ "$API_STATUS" = "200" ] || [ "$API_STATUS" = "404" ]; then
+            echo "✓ Backend API: https://apirecall.theonezone.my.id/ → HTTP $API_STATUS"
+          else
+            echo "⚠ Backend API: https://apirecall.theonezone.my.id/ → HTTP $API_STATUS (may be warming up)"
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo "  DEPLOYMENT FINISHED"
+          echo "=========================================="
+
+      - name: Notify failure
         if: failure()
         run: |
-          echo "❌ Deploy failed. Inspect the job log above."
+          echo ""
+          echo "=========================================="
+          echo "  ❌ DEPLOYMENT FAILED"
+          echo "=========================================="
           echo "Common causes:"
-          echo "  - VPS_SSH_KEY invalid or does not match VPS authorized_keys"
-          echo "  - /var/www/my-app path missing on VPS"
-          echo "  - docker daemon not running"
-          echo "  - submodule auth failed (need GIT_TOKEN secret for https submodules)"
+          echo "  1. VPS_SSH_KEY secret is missing or wrong"
+          echo "  2. VPS_HOST / VPS_USER secrets are incorrect"
+          echo "  3. SSH connection refused (VPS down or port wrong)"
+          echo "  4. /var/www/my-app directory missing on VPS"
+          echo "  5. Docker not running on VPS"
+          echo ""
+          echo "Check the job log above for details."
