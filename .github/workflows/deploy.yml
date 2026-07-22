@@ -34,8 +34,8 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      # ── 2. Debug: show files available ──
-      - name: Debug: List repo files
+      # ── 2. Debug show files available ──
+      - name: Debug List repo files
         run: |
           echo "=== Repository root files ==="
           ls -la
